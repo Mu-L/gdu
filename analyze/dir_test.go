@@ -16,9 +16,10 @@ func TestAnalyzeDir(t *testing.T) {
 	analyzer := CreateAnalyzer()
 	dir := analyzer.AnalyzeDir("test_dir", func(_ string) bool { return false })
 
-	assert.True(t, analyzer.GetProgress().Done)
+	c := analyzer.GetProgressChan()
+	progress := <-c
+	assert.Equal(t, "test_dir", progress.CurrentItemName)
 	analyzer.ResetProgress()
-	assert.False(t, analyzer.GetProgress().Done)
 
 	// test dir info
 	assert.Equal(t, "test_dir", dir.Name)

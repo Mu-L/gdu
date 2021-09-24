@@ -3,13 +3,16 @@ package tui
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 
+	"github.com/dundee/gdu/v5/build"
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/dundee/gdu/v5/pkg/device"
+	"github.com/dundee/gdu/v5/report"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -25,47 +28,13 @@ func (ui *UI) ListDevices(getter device.DevicesInfoGetter) error {
 		return err
 	}
 
-	ui.table.SetCell(0, 0, tview.NewTableCell("Device name").SetSelectable(false))
-	ui.table.SetCell(0, 1, tview.NewTableCell("Size").SetSelectable(false))
-	ui.table.SetCell(0, 2, tview.NewTableCell("Used").SetSelectable(false))
-	ui.table.SetCell(0, 3, tview.NewTableCell("Used part").SetSelectable(false))
-	ui.table.SetCell(0, 4, tview.NewTableCell("Free").SetSelectable(false))
-	ui.table.SetCell(0, 5, tview.NewTableCell("Mount point").SetSelectable(false))
-
-	var textColor, sizeColor string
-	if ui.UseColors {
-		textColor = "[#3498db:-:b]"
-		sizeColor = "[#edb20a:-:b]"
-	} else {
-		textColor = "[white:-:b]"
-		sizeColor = "[white:-:b]"
-	}
-
-	for i, device := range ui.devices {
-		ui.table.SetCell(i+1, 0, tview.NewTableCell(textColor+device.Name).SetReference(ui.devices[i]))
-		ui.table.SetCell(i+1, 1, tview.NewTableCell(ui.formatSize(device.Size, false, true)))
-		ui.table.SetCell(i+1, 2, tview.NewTableCell(sizeColor+ui.formatSize(device.Size-device.Free, false, true)))
-		ui.table.SetCell(i+1, 3, tview.NewTableCell(getDeviceUsagePart(device)))
-		ui.table.SetCell(i+1, 4, tview.NewTableCell(ui.formatSize(device.Free, false, true)))
-		ui.table.SetCell(i+1, 5, tview.NewTableCell(textColor+device.MountPoint))
-	}
-
-	ui.table.Select(1, 0)
-	ui.footer.SetText("")
-	ui.table.SetSelectedFunc(ui.deviceItemSelected)
+	ui.showDevices()
 
 	return nil
 }
 
-// AnalyzePath analyzes recursively disk usage in given path
+// AnalyzePath analyzes recursively disk usage for given path
 func (ui *UI) AnalyzePath(path string, parentDir *analyze.Dir) error {
-	abspath, _ := filepath.Abs(path)
-
-	_, err := ui.PathChecker(abspath)
-	if err != nil {
-		return err
-	}
-
 	ui.progress = tview.NewTextView().SetText("Scanning...")
 	ui.progress.SetBorder(true).SetBorderPadding(2, 2, 2, 2)
 	ui.progress.SetTitle(" Scanning... ")
@@ -85,20 +54,73 @@ func (ui *UI) AnalyzePath(path string, parentDir *analyze.Dir) error {
 	go ui.updateProgress()
 
 	go func() {
-		ui.currentDir = ui.Analyzer.AnalyzeDir(abspath, ui.CreateIgnoreFunc())
-		runtime.GC()
+		defer debug.SetGCPercent(debug.SetGCPercent(-1))
+		currentDir := ui.Analyzer.AnalyzeDir(path, ui.CreateIgnoreFunc())
+		debug.FreeOSMemory()
 
 		if parentDir != nil {
-			ui.currentDir.Parent = parentDir
-			parentDir.Files = parentDir.Files.RemoveByName(ui.currentDir.Name)
-			parentDir.Files.Append(ui.currentDir)
+			currentDir.Parent = parentDir
+			parentDir.Files = parentDir.Files.RemoveByName(currentDir.Name)
+			parentDir.Files.Append(currentDir)
 
 			links := make(analyze.AlreadyCountedHardlinks, 10)
 			ui.topDir.UpdateStats(links)
 		} else {
-			ui.topDirPath = abspath
-			ui.topDir = ui.currentDir
+			ui.topDirPath = path
+			ui.topDir = currentDir
 		}
+
+		ui.app.QueueUpdateDraw(func() {
+			ui.currentDir = currentDir
+			ui.showDir()
+			ui.pages.RemovePage("progress")
+		})
+
+		if ui.done != nil {
+			ui.done <- struct{}{}
+		}
+	}()
+
+	return nil
+}
+
+// ReadAnalysis reads analysis report from JSON file
+func (ui *UI) ReadAnalysis(input io.Reader) error {
+	ui.progress = tview.NewTextView().SetText("Reading analysis from file...")
+	ui.progress.SetBorder(true).SetBorderPadding(2, 2, 2, 2)
+	ui.progress.SetTitle(" Reading... ")
+	ui.progress.SetDynamicColors(true)
+
+	flex := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 10, 1, false).
+			AddItem(ui.progress, 8, 1, false).
+			AddItem(nil, 10, 1, false), 0, 50, false).
+		AddItem(nil, 0, 1, false)
+
+	ui.pages.AddPage("progress", flex, true, true)
+
+	go func() {
+		var err error
+		ui.currentDir, err = report.ReadAnalysis(input)
+		if err != nil {
+			ui.app.QueueUpdateDraw(func() {
+				ui.pages.RemovePage("progress")
+				ui.showErr("Error reading file", err)
+			})
+			if ui.done != nil {
+				ui.done <- struct{}{}
+			}
+			return
+		}
+		runtime.GC()
+
+		ui.topDirPath = ui.currentDir.GetPath()
+		ui.topDir = ui.currentDir
+
+		links := make(analyze.AlreadyCountedHardlinks, 10)
+		ui.topDir.UpdateStats(links)
 
 		ui.app.QueueUpdateDraw(func() {
 			ui.showDir()
@@ -174,6 +196,10 @@ func (ui *UI) deleteSelected(shouldEmpty bool) {
 }
 
 func (ui *UI) showFile() *tview.TextView {
+	if ui.currentDir == nil {
+		return nil
+	}
+
 	row, column := ui.table.GetSelection()
 	selectedFile := ui.table.GetCell(row, column).GetReference().(analyze.Item)
 	if selectedFile.IsDir() {
@@ -190,7 +216,9 @@ func (ui *UI) showFile() *tview.TextView {
 	scanner := bufio.NewScanner(f)
 
 	file := tview.NewTextView()
-	ui.currentDirLabel.SetText("[::b] --- " + selectedFile.GetPath() + " ---").SetDynamicColors(true)
+	ui.currentDirLabel.SetText("[::b] --- " +
+		strings.TrimPrefix(selectedFile.GetPath(), build.RootPathPrefix) +
+		" ---").SetDynamicColors(true)
 
 	readNextPart := func(linesCount int) int {
 		var err error
@@ -214,8 +242,14 @@ func (ui *UI) showFile() *tview.TextView {
 
 	file.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Rune() == 'q' || event.Key() == tcell.KeyESC {
-			f.Close()
-			ui.currentDirLabel.SetText("[::b] --- " + ui.currentDirPath + " ---").SetDynamicColors(true)
+			err = f.Close()
+			if err != nil {
+				ui.showErr("Error closing file", err)
+				return event
+			}
+			ui.currentDirLabel.SetText("[::b] --- " +
+				strings.TrimPrefix(ui.currentDirPath, build.RootPathPrefix) +
+				" ---").SetDynamicColors(true)
 			ui.pages.RemovePage("file")
 			ui.app.SetFocus(ui.table)
 			return event
@@ -242,7 +276,7 @@ func (ui *UI) showFile() *tview.TextView {
 	grid.AddItem(ui.header, 0, 0, 1, 1, 0, 0, false).
 		AddItem(ui.currentDirLabel, 1, 0, 1, 1, 0, 0, false).
 		AddItem(file, 2, 0, 1, 1, 0, 0, true).
-		AddItem(ui.footer, 3, 0, 1, 1, 0, 0, false)
+		AddItem(ui.footerLabel, 3, 0, 1, 1, 0, 0, false)
 
 	ui.pages.HidePage("background")
 	ui.pages.AddPage("file", grid, true, true)
@@ -251,6 +285,10 @@ func (ui *UI) showFile() *tview.TextView {
 }
 
 func (ui *UI) showInfo() {
+	if ui.currentDir == nil {
+		return
+	}
+
 	var content, numberColor string
 	row, column := ui.table.GetSelection()
 	selectedFile := ui.table.GetCell(row, column).GetReference().(analyze.Item)
@@ -271,7 +309,8 @@ func (ui *UI) showInfo() {
 	text.SetTitle(" Item info ")
 
 	content += "[::b]Name:[::-] " + selectedFile.GetName() + "\n"
-	content += "[::b]Path:[::-] " + selectedFile.GetPath() + "\n"
+	content += "[::b]Path:[::-] " +
+		strings.TrimPrefix(selectedFile.GetPath(), build.RootPathPrefix) + "\n"
 	content += "[::b]Type:[::-] " + selectedFile.GetType() + "\n\n"
 
 	content += "   [::b]Disk usage:[::-] "

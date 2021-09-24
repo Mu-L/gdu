@@ -3,7 +3,9 @@ package app
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime"
 
 	log "github.com/sirupsen/logrus"
@@ -12,6 +14,7 @@ import (
 	"github.com/dundee/gdu/v5/internal/common"
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/dundee/gdu/v5/pkg/device"
+	"github.com/dundee/gdu/v5/report"
 	"github.com/dundee/gdu/v5/stdout"
 	"github.com/dundee/gdu/v5/tui"
 	"github.com/gdamore/tcell/v2"
@@ -22,6 +25,7 @@ import (
 type UI interface {
 	ListDevices(getter device.DevicesInfoGetter) error
 	AnalyzePath(path string, parentDir *analyze.Dir) error
+	ReadAnalysis(input io.Reader) error
 	SetIgnoreDirPaths(paths []string)
 	SetIgnoreDirPatterns(paths []string) error
 	SetIgnoreHidden(value bool)
@@ -31,6 +35,8 @@ type UI interface {
 // Flags define flags accepted by Run
 type Flags struct {
 	LogFile           string
+	InputFile         string
+	OutputFile        string
 	IgnoreDirs        []string
 	IgnoreDirPatterns []string
 	MaxCores          int
@@ -46,42 +52,58 @@ type Flags struct {
 
 // App defines the main application
 type App struct {
-	Args    []string
-	Flags   *Flags
-	Istty   bool
-	Writer  io.Writer
-	TermApp common.TermApplication
-	Getter  device.DevicesInfoGetter
+	Args        []string
+	Flags       *Flags
+	Istty       bool
+	Writer      io.Writer
+	TermApp     common.TermApplication
+	Screen      tcell.Screen
+	Getter      device.DevicesInfoGetter
+	PathChecker func(string) (fs.FileInfo, error)
 }
 
 // Run starts gdu main logic
-func (a *App) Run() error {
+func (a *App) Run() (err error) {
+	var (
+		f  *os.File
+		ui UI
+	)
+
 	if a.Flags.ShowVersion {
 		fmt.Fprintln(a.Writer, "Version:\t", build.Version)
 		fmt.Fprintln(a.Writer, "Built time:\t", build.Time)
 		fmt.Fprintln(a.Writer, "Built user:\t", build.User)
-		return nil
+		return
 	}
 
-	f, err := os.OpenFile(a.Flags.LogFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err = os.OpenFile(a.Flags.LogFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return fmt.Errorf("opening log file: %w", err)
+		err = fmt.Errorf("opening log file: %w", err)
+		return
 	}
-	defer f.Close()
+	defer func() {
+		cerr := f.Close()
+		if err == nil {
+			err = cerr
+		}
+	}()
 	log.SetOutput(f)
 
 	path := a.getPath()
-	ui := a.createUI()
+	ui, err = a.createUI()
+	if err != nil {
+		return
+	}
 
-	if err := a.setNoCross(path); err != nil {
-		return err
+	if err = a.setNoCross(path); err != nil {
+		return
 	}
 
 	ui.SetIgnoreDirPaths(a.Flags.IgnoreDirs)
 
 	if len(a.Flags.IgnoreDirPatterns) > 0 {
-		if err := ui.SetIgnoreDirPatterns(a.Flags.IgnoreDirPatterns); err != nil {
-			return err
+		if err = ui.SetIgnoreDirPatterns(a.Flags.IgnoreDirPatterns); err != nil {
+			return
 		}
 	}
 
@@ -91,11 +113,12 @@ func (a *App) Run() error {
 
 	a.setMaxProcs()
 
-	if err := a.runAction(ui, path); err != nil {
-		return err
+	if err = a.runAction(ui, path); err != nil {
+		return
 	}
 
-	return ui.StartUILoop()
+	err = ui.StartUILoop()
+	return
 }
 
 func (a *App) getPath() string {
@@ -116,8 +139,28 @@ func (a *App) setMaxProcs() {
 	log.Printf("Max cores set to %d", runtime.GOMAXPROCS(0))
 }
 
-func (a *App) createUI() UI {
+func (a *App) createUI() (UI, error) {
 	var ui UI
+
+	if a.Flags.OutputFile != "" {
+		var output io.Writer
+		var err error
+		if a.Flags.OutputFile == "-" {
+			output = os.Stdout
+		} else {
+			output, err = os.OpenFile(a.Flags.OutputFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+			if err != nil {
+				return nil, fmt.Errorf("opening output file: %w", err)
+			}
+		}
+		ui = report.CreateExportUI(
+			a.Writer,
+			output,
+			!a.Flags.NoColor && a.Istty,
+			!a.Flags.NoProgress && a.Istty,
+		)
+		return ui, nil
+	}
 
 	if a.Flags.NonInteractive || !a.Istty {
 		ui = stdout.CreateStdoutUI(
@@ -127,14 +170,20 @@ func (a *App) createUI() UI {
 			a.Flags.ShowApparentSize,
 		)
 	} else {
-		ui = tui.CreateUI(a.TermApp, !a.Flags.NoColor, a.Flags.ShowApparentSize)
+		ui = tui.CreateUI(
+			a.TermApp,
+			a.Screen,
+			os.Stdout,
+			!a.Flags.NoColor,
+			a.Flags.ShowApparentSize,
+		)
 
 		if !a.Flags.NoColor {
 			tview.Styles.TitleColor = tcell.NewRGBColor(27, 161, 227)
 		}
 		tview.Styles.BorderColor = tcell.ColorDefault
 	}
-	return ui
+	return ui, nil
 }
 
 func (a *App) setNoCross(path string) error {
@@ -154,8 +203,34 @@ func (a *App) runAction(ui UI, path string) error {
 		if err := ui.ListDevices(a.Getter); err != nil {
 			return fmt.Errorf("loading mount points: %w", err)
 		}
+	} else if a.Flags.InputFile != "" {
+		var input io.Reader
+		var err error
+		if a.Flags.InputFile == "-" {
+			input = os.Stdin
+		} else {
+			input, err = os.OpenFile(a.Flags.InputFile, os.O_RDONLY, 0600)
+			if err != nil {
+				return fmt.Errorf("opening input file: %w", err)
+			}
+		}
+
+		if err := ui.ReadAnalysis(input); err != nil {
+			return fmt.Errorf("reading analysis: %w", err)
+		}
 	} else {
-		if err := ui.AnalyzePath(path, nil); err != nil {
+		abspath, _ := filepath.Abs(path)
+
+		if build.RootPathPrefix != "" {
+			abspath = build.RootPathPrefix + abspath
+		}
+
+		_, err := a.PathChecker(abspath)
+		if err != nil {
+			return err
+		}
+
+		if err := ui.AnalyzePath(abspath, nil); err != nil {
 			return fmt.Errorf("scanning dir: %w", err)
 		}
 	}

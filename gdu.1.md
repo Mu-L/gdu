@@ -1,5 +1,5 @@
 ---
-date: Jan 2021
+date: {{date}}
 section: 1
 title: gdu
 ---
@@ -48,6 +48,10 @@ non-interactive mode
 **-d**, **\--show-disks**\[=false\] Show all mounted disks
 
 **-a**, **\--show-apparent-size**\[=false\] Show apparent size
+
+**-f**, **\----input-file** Import analysis from JSON file. If the file is \"-\", read from standard input.
+
+**-o**, **\----output-file** Export all info into file as JSON. If the file is \"-\", write to standard output.
 
 **-v**, **\--version**\[=false\] Print version
 

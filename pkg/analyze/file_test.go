@@ -3,6 +3,7 @@ package analyze
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/dundee/gdu/v5/internal/testdir"
 	"github.com/stretchr/testify/assert"
@@ -229,7 +230,8 @@ func TestRemoveFile(t *testing.T) {
 	dir.Files = Files{subdir}
 	subdir.Files = Files{file}
 
-	RemoveItemFromDir(subdir, file)
+	err := RemoveItemFromDir(subdir, file)
+	assert.Nil(t, err)
 
 	assert.Equal(t, 0, len(subdir.Files))
 	assert.Equal(t, 1, subdir.ItemCount)
@@ -244,8 +246,12 @@ func TestRemoveFileWithErr(t *testing.T) {
 	fin := testdir.CreateTestDir()
 	defer fin()
 
-	os.Chmod("test_dir/nested", 0)
-	defer os.Chmod("test_dir/nested", 0755)
+	err := os.Chmod("test_dir/nested", 0)
+	assert.Nil(t, err)
+	defer func() {
+		err = os.Chmod("test_dir/nested", 0755)
+		assert.Nil(t, err)
+	}()
 
 	dir := &Dir{
 		File: &File{
@@ -261,7 +267,7 @@ func TestRemoveFileWithErr(t *testing.T) {
 		},
 	}
 
-	err := RemoveItemFromDir(dir, subdir)
+	err = RemoveItemFromDir(dir, subdir)
 	assert.Contains(t, err.Error(), "permission denied")
 }
 
@@ -346,8 +352,9 @@ func TestTruncateFileWithErr(t *testing.T) {
 func TestUpdateStats(t *testing.T) {
 	dir := Dir{
 		File: &File{
-			Name: "xxx",
-			Size: 1,
+			Name:  "xxx",
+			Size:  1,
+			Mtime: time.Date(2021, 8, 19, 0, 40, 0, 0, time.UTC),
 		},
 		ItemCount: 1,
 	}
@@ -355,11 +362,13 @@ func TestUpdateStats(t *testing.T) {
 	file := &File{
 		Name:   "yyy",
 		Size:   2,
+		Mtime:  time.Date(2021, 8, 19, 0, 41, 0, 0, time.UTC),
 		Parent: &dir,
 	}
 	file2 := &File{
 		Name:   "zzz",
 		Size:   3,
+		Mtime:  time.Date(2021, 8, 19, 0, 42, 0, 0, time.UTC),
 		Parent: &dir,
 	}
 	dir.Files = Files{file, file2}
@@ -367,4 +376,5 @@ func TestUpdateStats(t *testing.T) {
 	dir.UpdateStats(nil)
 
 	assert.Equal(t, int64(4096+5), dir.Size)
+	assert.Equal(t, 42, dir.GetMtime().Minute())
 }

@@ -3,6 +3,7 @@ MAJOR_VER := v5
 PACKAGE := github.com/dundee/$(NAME)/$(MAJOR_VER)
 CMD_GDU := cmd/gdu
 VERSION := $(shell git describe --tags 2>/dev/null)
+DATE := $(shell date +'%Y-%m-%d')
 GOFLAGS ?= -buildmode=pie -trimpath -mod=readonly -modcacherw
 LDFLAGS := -s -w -extldflags '-static' \
 	-X '$(PACKAGE)/build.Version=$(VERSION)' \
@@ -46,7 +47,9 @@ build-all:
 	cd dist; for file in gdu_windows_*; do zip $$file.zip $$file; done
 
 gdu.1: gdu.1.md
-	pandoc gdu.1.md -s -t man > gdu.1
+	sed 's/{{date}}/$(DATE)/g' gdu.1.md > gdu.1.date.md
+	pandoc gdu.1.date.md -s -t man > gdu.1
+	rm -f gdu.1.date.md
 
 man: gdu.1
 	cp gdu.1 dist
@@ -65,7 +68,7 @@ coverage-html: coverage
 	go tool cover -html=coverage.txt
 
 gobench:
-	go test -bench=. github.com/dundee/gdu/analyze
+	go test -bench=. $(PACKAGE)/pkg/analyze
 
 benchmark:
 	hyperfine --export-markdown=bench-cold.md \
@@ -78,6 +81,7 @@ benchmark:
 		'diskus ~' 'du -hs ~' 'dust -d0 ~'
 
 clean:
+	go mod tidy
 	-rm coverage.txt
 	-rm -r test_dir
 	-rm -r dist
@@ -88,5 +92,8 @@ clean-uncompressed-dist:
 shasums:
 	cd dist; sha256sum * > sha256sums.txt
 	cd dist; gpg --sign --armor --detach-sign sha256sums.txt
+
+release:
+	gh release create -t "gdu $(VERSION)" $(VERSION) ./dist/*
 
 .PHONY: run build test coverage coverage-html clean man

@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/gdamore/tcell/v2"
 )
@@ -8,6 +11,9 @@ import (
 func (ui *UI) keyPressed(key *tcell.EventKey) *tcell.EventKey {
 	if ui.pages.HasPage("file") {
 		return key // send event to primitive
+	}
+	if ui.filtering {
+		return key
 	}
 
 	if key.Key() == tcell.KeyEsc || key.Rune() == 'q' {
@@ -26,8 +32,15 @@ func (ui *UI) keyPressed(key *tcell.EventKey) *tcell.EventKey {
 	}
 
 	switch key.Rune() {
+	case 'Q':
+		ui.app.Stop()
+		fmt.Fprintf(ui.output, "%s\n", ui.currentDirPath)
+		return nil
 	case 'q':
 		ui.app.Stop()
+		return nil
+	case 'b':
+		ui.spawnShell()
 		return nil
 	case '?':
 		ui.showHelp()
@@ -37,6 +50,7 @@ func (ui *UI) keyPressed(key *tcell.EventKey) *tcell.EventKey {
 		ui.pages.HasPage("progress") ||
 		ui.pages.HasPage("deleting") ||
 		ui.pages.HasPage("emptying") ||
+		ui.pages.HasPage("help") ||
 		ui.pages.HasPage("info") {
 		return key
 	}
@@ -48,6 +62,12 @@ func (ui *UI) keyPressed(key *tcell.EventKey) *tcell.EventKey {
 
 	if key.Rune() == 'l' || key.Key() == tcell.KeyRight {
 		ui.handleRight()
+		return nil
+	}
+
+	if key.Key() == tcell.KeyTab && ui.filteringInput != nil {
+		ui.filtering = true
+		ui.app.SetFocus(ui.filteringInput)
 		return nil
 	}
 
@@ -74,6 +94,13 @@ func (ui *UI) keyPressed(key *tcell.EventKey) *tcell.EventKey {
 			ui.showDir()
 			ui.table.Select(row, column)
 		}
+	case 'm':
+		ui.showMtime = !ui.showMtime
+		if ui.currentDir != nil {
+			row, column := ui.table.GetSelection()
+			ui.showDir()
+			ui.table.Select(row, column)
+		}
 	case 'r':
 		if ui.currentDir != nil {
 			ui.rescanDir()
@@ -84,10 +111,12 @@ func (ui *UI) keyPressed(key *tcell.EventKey) *tcell.EventKey {
 		ui.setSorting("itemCount")
 	case 'n':
 		ui.setSorting("name")
-	default:
-		return key
+	case 'M':
+		ui.setSorting("mtime")
+	case '/':
+		ui.showFilterInput()
 	}
-	return nil
+	return key
 }
 
 func (ui *UI) handleLeft() {
@@ -128,4 +157,21 @@ func (ui *UI) handleDelete(shouldEmpty bool) {
 	} else {
 		ui.deleteSelected(shouldEmpty)
 	}
+}
+
+func (ui *UI) spawnShell() {
+	if ui.currentDir == nil {
+		return
+	}
+
+	ui.app.Suspend(func() {
+		if err := os.Chdir(ui.currentDirPath); err != nil {
+			ui.showErr("Error changing directory", err)
+			return
+		}
+
+		if err := ui.exec(getShellBin(), nil, os.Environ()); err != nil {
+			ui.showErr("Error executing shell", err)
+		}
+	})
 }

@@ -1,10 +1,7 @@
 package tui
 
 import (
-	"fmt"
-	"os"
-	"sort"
-	"time"
+	"io"
 
 	log "github.com/sirupsen/logrus"
 
@@ -15,52 +12,47 @@ import (
 	"github.com/rivo/tview"
 )
 
-const helpTextColorized = `
-  [red]up, down, k, j    [white]Move cursor up/down
-[red]pgup, pgdn, g, G    [white]Move cursor top/bottom
- [red]enter, right, l    [white]Select directory/device
-         [red]left, h    [white]Go to parent directory
-			   [red]d    [white]Delete selected file or directory
-			   [red]e    [white]Empty selected file or directory
-			   [red]v    [white]Show content of selected file
-			   [red]i    [white]Show info about selected item
-			   [red]r    [white]Rescan current directory
-			   [red]a    [white]Toggle between showing disk usage and apparent size
-			   [red]c    [white]Show/hide file count
-			   [red]n    [white]Sort by name (asc/desc)
-			   [red]s    [white]Sort by size (asc/desc)
-			   [red]C    [white]Sort by file count (asc/desc)
-			   [red]q    [white]Quit gdu
-`
-const helpText = `
-  [::b]up, down, k, j    [white:black:-]Move cursor up/down
-[::b]pgup, pgdn, g, G    [white:black:-]Move cursor top/bottom
- [::b]enter, right, l    [white:black:-]Select directory/device
+const helpText = `    [::b]up/down, k/j    [white:black:-]Move cursor up/down
+  [::b]pgup/pgdn, g/G    [white:black:-]Move cursor top/bottom
+ [::b]enter, right, l    [white:black:-]Go to directory/device
          [::b]left, h    [white:black:-]Go to parent directory
-			   [::b]d    [white:black:-]Delete selected file or directory
-			   [::b]e    [white:black:-]Empty selected file or directory
-			   [::b]v    [white:black:-]Show content of selected file
-			   [::b]i    [white:black:-]Show info about selected item
-			   [::b]r    [white:black:-]Rescan current directory
-			   [::b]a    [white:black:-]Toggle between showing disk usage and apparent size
-			   [::b]c    [white:black:-]Show/hide file count
-			   [::b]n    [white:black:-]Sort by name (asc/desc)
-			   [::b]s    [white:black:-]Sort by size (asc/desc)
-			   [::b]C    [white:black:-]Sort by file count (asc/desc)
-			   [::b]q    [white:black:-]Quit gdu
-`
+
+               [::b]r    [white:black:-]Rescan current directory
+               [::b]/    [white:black:-]Search items by name
+               [::b]a    [white:black:-]Toggle between showing disk usage and apparent size
+               [::b]c    [white:black:-]Show/hide file count
+               [::b]m    [white:black:-]Show/hide latest mtime
+               [::b]b    [white:black:-]Spawn shell in current directory
+               [::b]q    [white:black:-]Quit gdu
+               [::b]Q    [white:black:-]Quit gdu and print current directory path
+
+Item under cursor:
+               [::b]d    [white:black:-]Delete file or directory
+               [::b]e    [white:black:-]Empty file or directory
+               [::b]v    [white:black:-]Show content of file
+               [::b]i    [white:black:-]Show info about item
+
+Sort by (twice toggles asc/desc):
+               [::b]n    [white:black:-]Sort by name (asc/desc)
+               [::b]s    [white:black:-]Sort by size (asc/desc)
+               [::b]C    [white:black:-]Sort by file count (asc/desc)
+               [::b]M    [white:black:-]Sort by mtime (asc/desc)`
 
 // UI struct
 type UI struct {
 	*common.UI
 	app             common.TermApplication
+	screen          tcell.Screen
+	output          io.Writer
 	header          *tview.TextView
-	footer          *tview.TextView
+	footer          *tview.Flex
+	footerLabel     *tview.TextView
 	currentDirLabel *tview.TextView
 	pages           *tview.Pages
 	progress        *tview.TextView
 	help            *tview.Flex
 	table           *tview.Table
+	filteringInput  *tview.InputField
 	currentDir      *analyze.Dir
 	devices         []*device.Device
 	topDir          *analyze.Dir
@@ -68,36 +60,41 @@ type UI struct {
 	currentDirPath  string
 	askBeforeDelete bool
 	showItemCount   bool
+	showMtime       bool
+	filtering       bool
+	filterValue     string
 	sortBy          string
 	sortOrder       string
 	done            chan struct{}
 	remover         func(*analyze.Dir, analyze.Item) error
 	emptier         func(*analyze.Dir, analyze.Item) error
+	exec            func(argv0 string, argv []string, envv []string) error
 }
 
 // CreateUI creates the whole UI app
-func CreateUI(app common.TermApplication, useColors bool, showApparentSize bool) *UI {
+func CreateUI(app common.TermApplication, screen tcell.Screen, output io.Writer, useColors bool, showApparentSize bool) *UI {
 	ui := &UI{
 		UI: &common.UI{
 			UseColors:        useColors,
 			ShowApparentSize: showApparentSize,
 			Analyzer:         analyze.CreateAnalyzer(),
-			PathChecker:      os.Stat,
 		},
+		app:             app,
+		screen:          screen,
+		output:          output,
 		askBeforeDelete: true,
 		showItemCount:   false,
-		sortBy:          "size",
-		sortOrder:       "desc",
 		remover:         analyze.RemoveItemFromDir,
 		emptier:         analyze.EmptyFileFromDir,
+		exec:            Execute,
 	}
+	ui.resetSorting()
 
 	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
 		screen.Clear()
 		return false
 	})
 
-	ui.app = app
 	ui.app.SetInputCapture(ui.keyPressed)
 
 	var textColor, textBgColor tcell.Color
@@ -131,10 +128,13 @@ func CreateUI(app common.TermApplication, useColors bool, showApparentSize bool)
 			Background(tcell.ColorGray).Bold(true))
 	}
 
-	ui.footer = tview.NewTextView().SetDynamicColors(true)
-	ui.footer.SetTextColor(textColor)
-	ui.footer.SetBackgroundColor(textBgColor)
-	ui.footer.SetText(" No items to display. ")
+	ui.footerLabel = tview.NewTextView().SetDynamicColors(true)
+	ui.footerLabel.SetTextColor(textColor)
+	ui.footerLabel.SetBackgroundColor(textBgColor)
+	ui.footerLabel.SetText(" No items to display. ")
+
+	ui.footer = tview.NewFlex()
+	ui.footer.AddItem(ui.footerLabel, 0, 1, false)
 
 	grid := tview.NewGrid().SetRows(1, 1, 0, 1).SetColumns(0)
 	grid.AddItem(ui.header, 0, 0, 1, 1, 0, 0, false).
@@ -156,95 +156,24 @@ func (ui *UI) StartUILoop() error {
 	return ui.app.Run()
 }
 
+func (ui *UI) resetSorting() {
+	ui.sortBy = "size"
+	ui.sortOrder = "desc"
+}
+
 func (ui *UI) rescanDir() {
 	ui.Analyzer.ResetProgress()
-	ui.AnalyzePath(ui.currentDirPath, ui.currentDir.Parent)
-}
-
-func (ui *UI) showDir() {
-	ui.currentDirPath = ui.currentDir.GetPath()
-	ui.currentDirLabel.SetText("[::b] --- " + ui.currentDirPath + " ---").SetDynamicColors(true)
-
-	ui.table.Clear()
-
-	rowIndex := 0
-	if ui.currentDirPath != ui.topDirPath {
-		cell := tview.NewTableCell("                         [::b]/..")
-		cell.SetReference(ui.currentDir.Parent)
-		cell.SetStyle(tcell.Style{}.Foreground(tcell.ColorDefault))
-		ui.table.SetCell(0, 0, cell)
-		rowIndex++
-	}
-
-	ui.sortItems()
-
-	for i, item := range ui.currentDir.Files {
-		cell := tview.NewTableCell(ui.formatFileRow(item))
-		cell.SetStyle(tcell.Style{}.Foreground(tcell.ColorDefault))
-		cell.SetReference(ui.currentDir.Files[i])
-
-		ui.table.SetCell(rowIndex, 0, cell)
-		rowIndex++
-	}
-
-	var footerNumberColor, footerTextColor string
-	if ui.UseColors {
-		footerNumberColor = "[#ffffff:#2479d0:b]"
-		footerTextColor = "[black:#2479d0:-]"
-	} else {
-		footerNumberColor = "[black:white:b]"
-		footerTextColor = "[black:white:-]"
-	}
-
-	ui.footer.SetText(
-		" Total disk usage: " +
-			footerNumberColor +
-			ui.formatSize(ui.currentDir.Usage, true, false) +
-			" Apparent size: " +
-			footerNumberColor +
-			ui.formatSize(ui.currentDir.Size, true, false) +
-			" Items: " + footerNumberColor + fmt.Sprint(ui.currentDir.ItemCount) +
-			footerTextColor +
-			" Sorting by: " + ui.sortBy + " " + ui.sortOrder)
-
-	ui.table.Select(0, 0)
-	ui.table.ScrollToBeginning()
-	ui.app.SetFocus(ui.table)
-}
-
-func (ui *UI) sortItems() {
-	if ui.sortBy == "size" {
-		if ui.ShowApparentSize {
-			if ui.sortOrder == "desc" {
-				sort.Sort(analyze.ByApparentSize(ui.currentDir.Files))
-			} else {
-				sort.Sort(sort.Reverse(analyze.ByApparentSize(ui.currentDir.Files)))
-			}
-		} else {
-			if ui.sortOrder == "desc" {
-				sort.Sort(ui.currentDir.Files)
-			} else {
-				sort.Sort(sort.Reverse(ui.currentDir.Files))
-			}
-		}
-	}
-	if ui.sortBy == "itemCount" {
-		if ui.sortOrder == "desc" {
-			sort.Sort(analyze.ByItemCount(ui.currentDir.Files))
-		} else {
-			sort.Sort(sort.Reverse(analyze.ByItemCount(ui.currentDir.Files)))
-		}
-	}
-	if ui.sortBy == "name" {
-		if ui.sortOrder == "desc" {
-			sort.Sort(analyze.ByName(ui.currentDir.Files))
-		} else {
-			sort.Sort(sort.Reverse(analyze.ByName(ui.currentDir.Files)))
-		}
+	err := ui.AnalyzePath(ui.currentDirPath, ui.currentDir.Parent)
+	if err != nil {
+		ui.showErr("Error rescanning path", err)
 	}
 }
 
 func (ui *UI) fileItemSelected(row, column int) {
+	if ui.currentDir == nil {
+		return
+	}
+
 	origDir := ui.currentDir
 	selectedDir := ui.table.GetCell(row, column).GetReference().(analyze.Item)
 	if !selectedDir.IsDir() {
@@ -252,6 +181,7 @@ func (ui *UI) fileItemSelected(row, column int) {
 	}
 
 	ui.currentDir = selectedDir.(*analyze.Dir)
+	ui.hideFilterInput()
 	ui.showDir()
 
 	if selectedDir == origDir.Parent {
@@ -274,7 +204,12 @@ func (ui *UI) deviceItemSelected(row, column int) {
 		log.Printf("Creating path patterns for other devices failed: %s", paths)
 	}
 
-	ui.AnalyzePath(selectedDevice.MountPoint, nil)
+	ui.resetSorting()
+
+	err = ui.AnalyzePath(selectedDevice.MountPoint, nil)
+	if err != nil {
+		ui.showErr("Error analyzing device", err)
+	}
 }
 
 func (ui *UI) confirmDeletion(shouldEmpty bool) {
@@ -308,92 +243,4 @@ func (ui *UI) confirmDeletion(shouldEmpty bool) {
 	modal.SetBorderColor(tcell.ColorDefault)
 
 	ui.pages.AddPage("confirm", modal, true, true)
-}
-
-func (ui *UI) showErr(msg string, err error) {
-	modal := tview.NewModal().
-		SetText(msg + ": " + err.Error()).
-		AddButtons([]string{"ok"}).
-		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			ui.pages.RemovePage("error")
-		})
-
-	if !ui.UseColors {
-		modal.SetBackgroundColor(tcell.ColorGray)
-	}
-
-	ui.pages.AddPage("error", modal, true, true)
-}
-
-func (ui *UI) setSorting(newOrder string) {
-	if newOrder == ui.sortBy {
-		if ui.sortOrder == "asc" {
-			ui.sortOrder = "desc"
-		} else {
-			ui.sortOrder = "asc"
-		}
-	} else {
-		ui.sortBy = newOrder
-		ui.sortOrder = "asc"
-	}
-	ui.showDir()
-}
-
-func (ui *UI) updateProgress() {
-	color := "[white:black:b]"
-	if ui.UseColors {
-		color = "[red:black:b]"
-	}
-
-	progressChan := ui.Analyzer.GetProgressChan()
-	doneChan := ui.Analyzer.GetDoneChan()
-
-	var progress analyze.CurrentProgress
-
-	for {
-		select {
-		case progress = <-progressChan:
-		case <-doneChan:
-			return
-		}
-
-		func(itemCount int, totalSize int64, currentItem string) {
-			ui.app.QueueUpdateDraw(func() {
-				ui.progress.SetText("Total items: " +
-					color +
-					fmt.Sprint(itemCount) +
-					"[white:black:-] size: " +
-					color +
-					ui.formatSize(totalSize, false, false) +
-					"[white:black:-]\nCurrent item: [white:black:b]" +
-					currentItem)
-			})
-		}(progress.ItemCount, progress.TotalSize, progress.CurrentItemName)
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (ui *UI) showHelp() {
-	text := tview.NewTextView().SetDynamicColors(true)
-	text.SetBorder(true).SetBorderPadding(2, 2, 2, 2)
-	text.SetBorderColor(tcell.ColorDefault)
-	text.SetTitle(" gdu help ")
-
-	if ui.UseColors {
-		text.SetText(helpTextColorized)
-	} else {
-		text.SetText(helpText)
-	}
-
-	flex := tview.NewFlex().
-		AddItem(nil, 0, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(nil, 0, 1, false).
-			AddItem(text, 21, 1, false).
-			AddItem(nil, 0, 1, false), 80, 1, false).
-		AddItem(nil, 0, 1, false)
-
-	ui.help = flex
-	ui.pages.AddPage("help", flex, true, true)
 }

@@ -2,6 +2,7 @@ package device
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -22,9 +23,18 @@ func (t LinuxDevicesInfoGetter) GetMounts() (Devices, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	return readMountsFile(file)
+	devices, err := readMountsFile(file)
+	if err != nil {
+		if cerr := file.Close(); cerr != nil {
+			return nil, fmt.Errorf("%w; %s", err, cerr)
+		}
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	return devices, nil
 }
 
 // GetDevicesInfo returns result of GetMounts with usage info about mounted devices (by calling Statfs syscall)
@@ -68,7 +78,10 @@ func processMounts(mounts Devices, ignoreErrors bool) (Devices, error) {
 			continue
 		}
 
-		if strings.HasPrefix(mount.Name, "/dev") || mount.Fstype == "zfs" {
+		if strings.HasPrefix(mount.Name, "/dev") ||
+			mount.Fstype == "zfs" ||
+			mount.Fstype == "nfs" ||
+			mount.Fstype == "nfs4" {
 			info := &syscall.Statfs_t{}
 			err := syscall.Statfs(mount.MountPoint, info)
 			if err != nil && !ignoreErrors {
